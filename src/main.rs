@@ -1,5 +1,8 @@
+mod kt;
 mod parquet;
 mod ts;
+
+use kt::{key_of, mix, KT};
 
 use memchr::{memchr, memchr_iter};
 use parquet::{write_file, Column};
@@ -195,20 +198,79 @@ struct Ck {
     cid: B,
 }
 
+/// Short IDs (<= 15 bytes) live in a fixed-width key table; longer ones fall back to a HashMap.
+struct SMap {
+    kt: KT,
+    long: Map<(u64, u64)>,
+}
+
+impl SMap {
+    fn new(n: usize) -> SMap {
+        SMap { kt: KT::with_capacity(n), long: new_map() }
+    }
+    #[inline(always)]
+    fn get(&self, b: &[u8]) -> Option<(u64, u64)> {
+        match key_of(b) {
+            Some((k0, k1)) => self.kt.get(k0, k1).map(|e| (e[2], e[3])),
+            None => self.long.get(b).copied(),
+        }
+    }
+    /// Returns the existing (v2, v3) or inserts the given ones and returns them. v2 != u64::MAX.
+    fn get_or_insert(&mut self, b: B, v2: u64, v3: u64) -> (u64, u64) {
+        match key_of(b) {
+            Some((k0, k1)) => {
+                let (e, new) = self.kt.entry(k0, k1);
+                if new {
+                    e[2] = v2;
+                    e[3] = v3;
+                }
+                (e[2], e[3])
+            }
+            None => *self.long.entry(b).or_insert((v2, v3)),
+        }
+    }
+    fn set(&mut self, b: B, v2: u64, v3: u64) {
+        match key_of(b) {
+            Some((k0, k1)) => {
+                let (e, _) = self.kt.entry(k0, k1);
+                e[2] = v2;
+                e[3] = v3;
+            }
+            None => {
+                self.long.insert(b, (v2, v3));
+            }
+        }
+    }
+}
+
+const SEED_P: u64 = 0x2545_F491_4F6C_DD1D;
+const SEED_E1: u64 = 0x9E6C_63D0_676A_9A99;
+const SEED_E2: u64 = 0x1D8E_4E27_C47D_124F;
+
+/// Person key: a 63-bit hash of the person's name (never u64::MAX).
+#[inline(always)]
+fn phash(b: &[u8]) -> u64 {
+    match key_of(b) {
+        Some((k0, k1)) => mix(k0, k1, SEED_P) >> 1,
+        None => h64(b) >> 1,
+    }
+}
+
 struct Ctx {
     ws: i64,
     we: i64,
-    products: Map<u8>,
+    products: SMap,
     ncat: usize,
-    camps: Map<u32>,
-    persons: Map<(u64, B)>,
+    camps: SMap,
+    persons: SMap,
 }
 
-#[inline]
-fn person_of(cx: &Ctx, uid: B) -> (u64, B) {
+/// (person key, packed name)
+#[inline(always)]
+fn person_of(cx: &Ctx, uid: B) -> (u64, u64) {
     match cx.persons.get(uid) {
-        Some(&(h, n)) => (h, n),
-        None => (h64(uid), uid),
+        Some(v) => v,
+        None => (phash(uid), pack_name(uid)),
     }
 }
 
@@ -228,7 +290,10 @@ fn parse_events(buf: B, cx: &Ctx, out: &mut EvOut) {
         if eid.is_empty() {
             return;
         }
-        let h1 = h64(eid);
+        let (h1, h2) = match key_of(eid) {
+            Some((k0, k1)) => (mix(k0, k1, SEED_E1), (mix(k0, k1, SEED_E2) >> 32) as u32),
+            None => (h64(eid), h32b(eid)),
+        };
         let ingest = parse_ts(ing).unwrap_or(i64::MAX);
         let rel: u64 = if ingest == i64::MAX {
             u32::MAX as u64
@@ -259,11 +324,11 @@ fn parse_events(buf: B, cx: &Ctx, out: &mut EvOut) {
             }
             let (ph, name) = person_of(cx, uid);
             let q = (ph as usize) % P;
-            let cat = *cx.products.get(prod).unwrap_or(&(cx.ncat as u8));
+            let cat = match cx.products.get(prod) { Some((c, _)) => c as u8, None => cx.ncat as u8 };
             loc = (out.tid << 48) | ((q as u64) << 32) | out.pb[q].len() as u64;
-            out.pb[q].push(Ev { ts, ph, name: pack_name(name), price: pr, cat, ty });
+            out.pb[q].push(Ev { ts, ph, name, price: pr, cat, ty });
         }
-        let k2 = ((h32b(eid) as u64) << 32) | rel;
+        let k2 = ((h2 as u64) << 32) | rel;
         out.db[(h1 as usize) % P].push(Tup { h1, loc, k2 });
     });
 }
@@ -278,7 +343,7 @@ fn parse_clicks(buf: B, cx: &Ctx, out: &mut [Vec<Ck>]) {
         if ts < cx.ws - WEEK || ts >= cx.we {
             return;
         }
-        let camp = match cx.camps.get(camp) { Some(&c) => c, None => return };
+        let camp = match cx.camps.get(camp) { Some((c, _)) => c as u32, None => return };
         let (ph, _) = person_of(cx, uid);
         out[(ph as usize) % P].push(Ck { ph, ts, camp, cid });
     });
@@ -355,17 +420,17 @@ fn main() {
     let _ = ncat;
     let ncat_total = cat_names.len();
     assert!(ncat_total < 255);
-    let mut products = new_map::<u8>();
+    let mut products = SMap::new(prod_rows.len());
     for (p, c) in &prod_rows {
         let ci = cat_names.iter().position(|x| x == c).unwrap();
-        products.insert(*p, ci as u8);
+        products.set(p, ci as u64, 0);
     }
 
     // campaigns
     let camp_buf = read_static(&data.join("campaigns.csv"));
     let mut camp_ids: Vec<B> = Vec::new();
     let mut camp_ch: Vec<B> = Vec::new();
-    let mut camps = new_map::<u32>();
+    let mut camps = SMap::new(4096);
     let mut first = true;
     for_each_line(camp_buf, |l| {
         if first {
@@ -373,8 +438,8 @@ fn main() {
             return;
         }
         if let Some([c, ch]) = split_fields::<2>(l) {
-            if !camps.contains_key(c) {
-                camps.insert(c, camp_ids.len() as u32);
+            if camps.get(c).is_none() {
+                camps.set(c, camp_ids.len() as u64, 0);
                 camp_ids.push(c);
                 camp_ch.push(ch);
             }
@@ -405,7 +470,8 @@ fn main() {
         }
         v
     });
-    let mut ids = new_map::<u32>();
+    let nlinks: usize = link_parts.iter().map(|p| p.len()).sum();
+    let mut ids = SMap::new(nlinks + 16);
     let mut names: Vec<B> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
     fn find(p: &mut Vec<u32>, mut x: u32) -> u32 {
@@ -419,11 +485,13 @@ fn main() {
     for part in &link_parts {
         for &(a, b) in part {
             let mut get = |s: B| -> u32 {
-                *ids.entry(s).or_insert_with(|| {
+                let next = names.len() as u64;
+                let (i, _) = ids.get_or_insert(s, next, 0);
+                if i == next {
                     names.push(s);
-                    parent.push(names.len() as u32 - 1);
-                    names.len() as u32 - 1
-                })
+                    parent.push(next as u32);
+                }
+                i as u32
             };
             let ia = get(a);
             let ib = get(b);
@@ -444,10 +512,10 @@ fn main() {
             has[r] = true;
         }
     }
-    let mut persons = new_map::<(u64, B)>();
+    let mut persons = SMap::new(n);
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        persons.insert(names[i], (h64(best[r]), best[r]));
+        persons.set(names[i], phash(best[r]), pack_name(best[r]));
     }
     lap("links");
 

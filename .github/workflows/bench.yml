@@ -1,0 +1,54 @@
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: "events in the benchmark dataset"
+        default: "20000000"
+      perf:
+        description: "also record a perf profile (yes/no)"
+        default: "yes"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      B: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+      E: ${{ github.event.inputs.events }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache dataset
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/bench
+          key: bench-data-seed7-${{ github.event.inputs.events }}-v1
+      - name: Generate dataset
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/gen && cd /tmp/gen
+          curl -sSfL -o generator.zip $B/generator.zip && unzip -q generator.zip
+          cargo build --release --manifest-path /tmp/gen/generator/Cargo.toml
+          /tmp/gen/generator/target/release/generate --seed 7 --events $E --clicks $((E/4)) --output /tmp/bench
+      - name: Build (scorer flags + debug info for perf)
+        run: |
+          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release
+          nproc; lscpu | grep -E "Model name|^CPU\(s\)|Thread"; free -g
+      - name: Warm page cache, then time 5 runs
+        run: |
+          cat /tmp/bench/*/*.csv > /dev/null
+          for i in 1 2 3 4 5; do
+            rm -rf /tmp/bout; mkdir /tmp/bout
+            /usr/bin/time -f "run $i: %e s wall, %U s user, %S s sys, maxrss %M KB" env DATA_DIR=/tmp/bench OUTPUT_DIR=/tmp/bout SS_TIMING=1 ./target/release/shopping
+          done
+      - name: perf profile
+        if: github.event.inputs.perf == 'yes'
+        run: |
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic linux-tools-$(uname -r) >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
+          rm -rf /tmp/bout; mkdir /tmp/bout
+          perf record -g -F 2000 -o /tmp/perf.data env DATA_DIR=/tmp/bench OUTPUT_DIR=/tmp/bout ./target/release/shopping 2>/dev/null
+          perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -45
+          echo "---- by source line (top 40) ----"
+          perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -40
