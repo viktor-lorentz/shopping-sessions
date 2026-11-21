@@ -148,16 +148,43 @@ fn read_static(p: &Path) -> B {
 // ---------- records ----------
 #[derive(Clone, Copy)]
 struct Ev {
-    eid_h: u64,
-    eid: B,
-    ingest: i64,
     ts: i64,
     ph: u64,
-    name: B,
+    name: u64, // packed: ptr | len << 48
+    price: u32,
     cat: u8,
     ty: u8, // 0 view 1 cart 2 purchase
-    price: u32,
-    valid: bool,
+}
+
+/// Dedup key: 96-bit event id hash, relative ingest second, and where the event's record lives.
+#[derive(Clone, Copy)]
+struct Tup {
+    h1: u64,
+    loc: u64, // thread << 48 | person bucket << 32 | index; NONE for an invalid kept-candidate
+    k2: u64,  // h2 (32 bits) << 32 | ingest relative seconds (32 bits)
+}
+const NONE: u64 = u64::MAX;
+
+#[inline]
+fn pack_name(b: &[u8]) -> u64 {
+    debug_assert!(b.len() < 65536);
+    (b.as_ptr() as u64) | ((b.len() as u64) << 48)
+}
+#[inline]
+fn unpack_name(p: u64) -> B {
+    unsafe { std::slice::from_raw_parts((p & 0x0000_FFFF_FFFF_FFFF) as *const u8, (p >> 48) as usize) }
+}
+
+#[inline]
+fn h32b(b: &[u8]) -> u32 {
+    // second, independent hash (different seed and multiplier) of the event id
+    const K: u64 = 0x9fb2_1c65_1e98_df25;
+    let mut h: u64 = 0xC2B2_AE3D_27D4_EB4F ^ (b.len() as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    for &x in b {
+        h = (h ^ x as u64).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    (h >> 32) as u32
 }
 
 #[derive(Clone, Copy)]
@@ -187,16 +214,28 @@ fn person_of(cx: &Ctx, uid: B) -> (u64, B) {
 
 const P: usize = 256;
 
-fn parse_events(buf: B, cx: &Ctx, out: &mut [Vec<Ev>]) {
+struct EvOut {
+    tid: u64,
+    pb: Vec<Vec<Ev>>,  // valid events by person bucket
+    db: Vec<Vec<Tup>>, // dedup tuples by eid bucket
+}
+
+fn parse_events(buf: B, cx: &Ctx, out: &mut EvOut) {
+    let base_s = cx.ws / 1000 - 40 * 86_400;
     for_each_line(buf, |line| {
         let f = match split_fields::<7>(line) { Some(f) => f, None => return };
         let [eid, uid, tsb, ing, ety, prod, price] = f;
         if eid.is_empty() {
             return;
         }
-        let eid_h = h64(eid);
+        let h1 = h64(eid);
         let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-        let mut e = Ev { eid_h, eid, ingest, ts: 0, ph: 0, name: &[], cat: 0, ty: 0, price: 0, valid: false };
+        let rel: u64 = if ingest == i64::MAX {
+            u32::MAX as u64
+        } else {
+            (ingest.div_euclid(1000) - base_s).clamp(0, u32::MAX as i64) as u64
+        };
+        let mut loc = NONE;
         'v: {
             if uid.is_empty() || prod.is_empty() {
                 break 'v;
@@ -219,15 +258,13 @@ fn parse_events(buf: B, cx: &Ctx, out: &mut [Vec<Ev>]) {
                 break 'v;
             }
             let (ph, name) = person_of(cx, uid);
-            e.ts = ts;
-            e.ph = ph;
-            e.name = name;
-            e.ty = ty;
-            e.price = pr;
-            e.cat = *cx.products.get(prod).unwrap_or(&(cx.ncat as u8));
-            e.valid = true;
+            let q = (ph as usize) % P;
+            let cat = *cx.products.get(prod).unwrap_or(&(cx.ncat as u8));
+            loc = (out.tid << 48) | ((q as u64) << 32) | out.pb[q].len() as u64;
+            out.pb[q].push(Ev { ts, ph, name: pack_name(name), price: pr, cat, ty });
         }
-        out[(eid_h as usize) % P].push(e);
+        let k2 = ((h32b(eid) as u64) << 32) | rel;
+        out.db[(h1 as usize) % P].push(Tup { h1, loc, k2 });
     });
 }
 
@@ -421,15 +458,19 @@ fn main() {
     let ck_chunks = chunks_of(&data.join("clicks"), 8 << 20);
     let next_e = AtomicUsize::new(0);
     let next_c = AtomicUsize::new(0);
-    let parsed: Vec<(Vec<Vec<Ev>>, Vec<Vec<Ck>>)> = par(nthreads, |_| {
-        let mut eb: Vec<Vec<Ev>> = (0..P).map(|_| Vec::new()).collect();
+    let parsed: Vec<(EvOut, Vec<Vec<Ck>>)> = par(nthreads, |tid| {
+        let mut eo = EvOut {
+            tid: tid as u64,
+            pb: (0..P).map(|_| Vec::new()).collect(),
+            db: (0..P).map(|_| Vec::new()).collect(),
+        };
         let mut cb: Vec<Vec<Ck>> = (0..P).map(|_| Vec::new()).collect();
         loop {
             let i = next_e.fetch_add(1, Ordering::Relaxed);
             if i >= ev_chunks.len() {
                 break;
             }
-            parse_events(ev_chunks[i].buf, &cx, &mut eb);
+            parse_events(ev_chunks[i].buf, &cx, &mut eo);
         }
         loop {
             let i = next_c.fetch_add(1, Ordering::Relaxed);
@@ -438,41 +479,67 @@ fn main() {
             }
             parse_clicks(ck_chunks[i].buf, &cx, &mut cb);
         }
-        (eb, cb)
+        (eo, cb)
     });
     lap("parse");
 
-    // ---- dedup (by eid bucket) -> scatter survivors by person bucket ----
+    // ---- dedup: tuples only; losers get a bit set in a kill bitmap ----
+    use std::sync::atomic::AtomicU64;
+    let kills: Vec<Vec<Vec<AtomicU64>>> = parsed
+        .iter()
+        .map(|(eo, _)| {
+            eo.pb.iter().map(|v| (0..(v.len() + 63) / 64).map(|_| AtomicU64::new(0)).collect()).collect()
+        })
+        .collect();
     let next_b = AtomicUsize::new(0);
-    let survivors: Vec<Vec<Vec<Ev>>> = par(nthreads, |_| {
-        let mut outb: Vec<Vec<Ev>> = (0..P).map(|_| Vec::new()).collect();
+    par(nthreads, |_| {
+        let mut all: Vec<Tup> = Vec::new();
+        let mut table: Vec<u32> = Vec::new();
+        let kill = |loc: u64| {
+            if loc != NONE {
+                let t = (loc >> 48) as usize;
+                let q = ((loc >> 32) & 0xFFFF) as usize;
+                let i = (loc & 0xFFFF_FFFF) as usize;
+                kills[t][q][i >> 6].fetch_or(1u64 << (i & 63), Ordering::Relaxed);
+            }
+        };
         loop {
             let b = next_b.fetch_add(1, Ordering::Relaxed);
             if b >= P {
                 break;
             }
-            let mut m: Map<Ev> = new_map();
-            for t in &parsed {
-                for e in &t.0[b] {
-                    match m.get_mut(e.eid) {
-                        Some(cur) => {
-                            if e.ingest < cur.ingest {
-                                *cur = *e;
-                            }
-                        }
-                        None => {
-                            m.insert(e.eid, *e);
-                        }
-                    }
-                }
+            all.clear();
+            for (eo, _) in &parsed {
+                all.extend_from_slice(&eo.db[b]);
             }
-            for (_, e) in m {
-                if e.valid {
-                    outb[(e.ph as usize) % P].push(e);
+            let cap = (all.len() * 2).next_power_of_two().max(16);
+            table.clear();
+            table.resize(cap, u32::MAX);
+            let mask = cap - 1;
+            for i in 0..all.len() {
+                let t = all[i];
+                let mut slot = ((t.h1 >> 24) as usize) & mask;
+                loop {
+                    let w = table[slot];
+                    if w == u32::MAX {
+                        table[slot] = i as u32;
+                        break;
+                    }
+                    let o = all[w as usize];
+                    if o.h1 == t.h1 && (o.k2 >> 32) == (t.k2 >> 32) {
+                        // same event id: keep the smaller ingest, kill the other
+                        if (t.k2 & 0xFFFF_FFFF) < (o.k2 & 0xFFFF_FFFF) {
+                            table[slot] = i as u32;
+                            kill(o.loc);
+                        } else {
+                            kill(t.loc);
+                        }
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
                 }
             }
         }
-        outb
     });
     lap("dedup");
 
@@ -493,9 +560,15 @@ fn main() {
             if b >= P {
                 break;
             }
-            let mut evs: Vec<Ev> = Vec::new();
-            for t in &survivors {
-                evs.extend_from_slice(&t[b]);
+            let total: usize = parsed.iter().map(|(eo, _)| eo.pb[b].len()).sum();
+            let mut evs: Vec<Ev> = Vec::with_capacity(total);
+            for (t, (eo, _)) in parsed.iter().enumerate() {
+                let bits = &kills[t][b];
+                for (i, e) in eo.pb[b].iter().enumerate() {
+                    if bits[i >> 6].load(Ordering::Relaxed) & (1u64 << (i & 63)) == 0 {
+                        evs.push(*e);
+                    }
+                }
             }
             let mut cks: Vec<Ck> = Vec::new();
             for t in &parsed {
@@ -627,7 +700,7 @@ struct Sess {
 
 fn process_person(pe: &[Ev], pc: &[Ck], acc: &mut Acc, ncamp: usize, ndays: usize, day0: i64, ncat: usize) {
     // sessionize
-    let name = pe[0].name;
+    let name = unpack_name(pe[0].name);
     let mut sessions: Vec<Sess> = Vec::new();
     let mut prev = i64::MIN;
     for e in pe {
