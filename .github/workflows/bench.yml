@@ -8,6 +8,9 @@ on:
       perf:
         description: "also record a perf profile (yes/no)"
         default: "yes"
+      seed:
+        description: "dataset seed (7 = tuning set, 11 = held-out validation set)"
+        default: "7"
 
 jobs:
   bench:
@@ -23,14 +26,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/bench
-          key: bench-data-seed7-${{ github.event.inputs.events }}-v1
+          key: bench-data-seed${{ github.event.inputs.seed }}-${{ github.event.inputs.events }}-v1
       - name: Generate dataset
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/gen && cd /tmp/gen
           curl -sSfL -o generator.zip $B/generator.zip && unzip -q generator.zip
           cargo build --release --manifest-path /tmp/gen/generator/Cargo.toml
-          /tmp/gen/generator/target/release/generate --seed 7 --events $E --clicks $((E/4)) --output /tmp/bench
+          /tmp/gen/generator/target/release/generate --seed ${{ github.event.inputs.seed }} --events $E --clicks $((E/4)) --output /tmp/bench
       - name: Build (scorer flags + debug info for perf)
         run: |
           RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release

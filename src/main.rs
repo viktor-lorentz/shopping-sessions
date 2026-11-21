@@ -1,3 +1,4 @@
+mod csv;
 mod kt;
 mod parquet;
 mod ts;
@@ -265,14 +266,6 @@ struct Ctx {
     persons: SMap,
 }
 
-/// (person key, packed name)
-#[inline(always)]
-fn person_of(cx: &Ctx, uid: B) -> (u64, u64) {
-    match cx.persons.get(uid) {
-        Some(v) => v,
-        None => (phash(uid), pack_name(uid)),
-    }
-}
 
 const P: usize = 256;
 
@@ -282,71 +275,172 @@ struct EvOut {
     db: Vec<Vec<Tup>>, // dedup tuples by eid bucket
 }
 
+const BLK: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PendEv {
+    h1: u64,
+    k2: u64,
+    ts: i64,
+    uid: B,
+    prod: B,
+    uk: Option<(u64, u64)>,
+    pk: Option<(u64, u64)>,
+    price: u32,
+    ty: u8,
+    valid: bool,
+}
+
+impl SMap {
+    #[inline(always)]
+    fn prefetch(&self, k: Option<(u64, u64)>) {
+        if let Some((k0, k1)) = k {
+            self.kt.prefetch(k0, k1);
+        }
+    }
+    #[inline(always)]
+    fn get_k(&self, b: &[u8], k: Option<(u64, u64)>) -> Option<(u64, u64)> {
+        match k {
+            Some((k0, k1)) => self.kt.get(k0, k1).map(|e| (e[2], e[3])),
+            None => self.long.get(b).copied(),
+        }
+    }
+}
+
 fn parse_events(buf: B, cx: &Ctx, out: &mut EvOut) {
     let base_s = cx.ws / 1000 - 40 * 86_400;
-    for_each_line(buf, |line| {
-        let f = match split_fields::<7>(line) { Some(f) => f, None => return };
-        let [eid, uid, tsb, ing, ety, prod, price] = f;
-        if eid.is_empty() {
-            return;
-        }
-        let (h1, h2) = match key_of(eid) {
-            Some((k0, k1)) => (mix(k0, k1, SEED_E1), (mix(k0, k1, SEED_E2) >> 32) as u32),
-            None => (h64(eid), h32b(eid)),
-        };
-        let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-        let rel: u64 = if ingest == i64::MAX {
-            u32::MAX as u64
-        } else {
-            (ingest.div_euclid(1000) - base_s).clamp(0, u32::MAX as i64) as u64
-        };
-        let mut loc = NONE;
-        'v: {
-            if uid.is_empty() || prod.is_empty() {
-                break 'v;
+    let mut lines = csv::Lines::new(buf);
+    let empty: B = &[];
+    let mut pend = [PendEv { h1: 0, k2: 0, ts: 0, uid: empty, prod: empty, uk: None, pk: None, price: 0, ty: 0, valid: false }; BLK];
+    let mut done = false;
+    while !done {
+        // stage 1: tokenize + validate + hash, prefetch the person and product slots
+        let mut n = 0;
+        while n < BLK {
+            let f = match lines.next::<7>() {
+                None => {
+                    done = true;
+                    break;
+                }
+                Some(None) => continue,
+                Some(Some(f)) => f,
+            };
+            let [eid, uid, tsb, ing, ety, prod, price] = f;
+            if eid.is_empty() {
+                continue;
             }
-            let ts = match parse_ts(tsb) { Some(t) => t, None => break 'v };
+            let (h1, h2) = match key_of(eid) {
+                Some((k0, k1)) => (mix(k0, k1, SEED_E1), (mix(k0, k1, SEED_E2) >> 32) as u32),
+                None => (h64(eid), h32b(eid)),
+            };
+            let ingest = parse_ts(ing).unwrap_or(i64::MAX);
+            let rel: u64 = if ingest == i64::MAX {
+                u32::MAX as u64
+            } else {
+                (ingest.div_euclid(1000) - base_s).clamp(0, u32::MAX as i64) as u64
+            };
+            let p = &mut pend[n];
+            p.h1 = h1;
+            p.k2 = ((h2 as u64) << 32) | rel;
+            p.valid = false;
+            n += 1;
+            if uid.is_empty() || prod.is_empty() {
+                continue;
+            }
+            let ts = match parse_ts(tsb) { Some(t) => t, None => continue };
             if ts < cx.ws || ts >= cx.we {
-                break 'v;
+                continue;
             }
             let ty = match ety {
                 b"view" => 0,
                 b"cart" => 1,
                 b"purchase" => 2,
-                _ => break 'v,
+                _ => continue,
             };
             let mut pr = 0;
             if ty == 2 {
-                pr = match parse_price(price) { Some(p) => p, None => break 'v };
+                pr = match parse_price(price) { Some(x) => x, None => continue };
             }
             if ingest.saturating_sub(ts) > DAY {
-                break 'v;
+                continue;
             }
-            let (ph, name) = person_of(cx, uid);
-            let q = (ph as usize) % P;
-            let cat = match cx.products.get(prod) { Some((c, _)) => c as u8, None => cx.ncat as u8 };
-            loc = (out.tid << 48) | ((q as u64) << 32) | out.pb[q].len() as u64;
-            out.pb[q].push(Ev { ts, ph, name, price: pr, cat, ty });
+            let uk = key_of(uid);
+            let pk = key_of(prod);
+            cx.persons.prefetch(uk);
+            cx.products.prefetch(pk);
+            p.ts = ts;
+            p.uid = uid;
+            p.prod = prod;
+            p.uk = uk;
+            p.pk = pk;
+            p.price = pr;
+            p.ty = ty;
+            p.valid = true;
         }
-        let k2 = ((h2 as u64) << 32) | rel;
-        out.db[(h1 as usize) % P].push(Tup { h1, loc, k2 });
-    });
+        // stage 2: resolve person and category, scatter
+        for p in &pend[..n] {
+            let mut loc = NONE;
+            if p.valid {
+                let (ph, name) = match cx.persons.get_k(p.uid, p.uk) {
+                    Some(v) => v,
+                    None => (phash(p.uid), pack_name(p.uid)),
+                };
+                let cat = match cx.products.get_k(p.prod, p.pk) { Some((c, _)) => c as u8, None => cx.ncat as u8 };
+                let q = (ph as usize) % P;
+                loc = (out.tid << 48) | ((q as u64) << 32) | out.pb[q].len() as u64;
+                out.pb[q].push(Ev { ts: p.ts, ph, name, price: p.price, cat, ty: p.ty });
+            }
+            out.db[(p.h1 as usize) % P].push(Tup { h1: p.h1, loc, k2: p.k2 });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendCk {
+    ts: i64,
+    uid: B,
+    cid: B,
+    camp: B,
+    uk: Option<(u64, u64)>,
+    ck: Option<(u64, u64)>,
 }
 
 fn parse_clicks(buf: B, cx: &Ctx, out: &mut [Vec<Ck>]) {
-    for_each_line(buf, |line| {
-        let [cid, uid, camp, tsb] = match split_fields::<4>(line) { Some(f) => f, None => return };
-        if cid.is_empty() || uid.is_empty() {
-            return;
+    let mut lines = csv::Lines::new(buf);
+    let empty: B = &[];
+    let mut pend = [PendCk { ts: 0, uid: empty, cid: empty, camp: empty, uk: None, ck: None }; BLK];
+    let mut done = false;
+    while !done {
+        let mut n = 0;
+        while n < BLK {
+            let [cid, uid, camp, tsb] = match lines.next::<4>() {
+                None => {
+                    done = true;
+                    break;
+                }
+                Some(None) => continue,
+                Some(Some(f)) => f,
+            };
+            if cid.is_empty() || uid.is_empty() {
+                continue;
+            }
+            let ts = match parse_ts(tsb) { Some(t) => t, None => continue };
+            if ts < cx.ws - WEEK || ts >= cx.we {
+                continue;
+            }
+            let uk = key_of(uid);
+            let ck = key_of(camp);
+            cx.persons.prefetch(uk);
+            cx.camps.prefetch(ck);
+            pend[n] = PendCk { ts, uid, cid, camp, uk, ck };
+            n += 1;
         }
-        let ts = match parse_ts(tsb) { Some(t) => t, None => return };
-        if ts < cx.ws - WEEK || ts >= cx.we {
-            return;
+        for p in &pend[..n] {
+            let camp = match cx.camps.get_k(p.camp, p.ck) { Some((c, _)) => c as u32, None => continue };
+            let ph = match cx.persons.get_k(p.uid, p.uk) { Some((h, _)) => h, None => phash(p.uid) };
+            out[(ph as usize) % P].push(Ck { ph, ts: p.ts, camp, cid: p.cid });
         }
-        let camp = match cx.camps.get(camp) { Some((c, _)) => c as u32, None => return };
-        let (ph, _) = person_of(cx, uid);
-        out[(ph as usize) % P].push(Ck { ph, ts, camp, cid });
-    });
+    }
 }
 
 // ---------- accumulators ----------
@@ -460,13 +554,14 @@ fn main() {
             if i >= link_chunks.len() {
                 break;
             }
-            for_each_line(link_chunks[i].buf, |l| {
-                if let Some([a, b]) = split_fields::<2>(l) {
+            let mut lines = csv::Lines::new(link_chunks[i].buf);
+            while let Some(r) = lines.next::<2>() {
+                if let Some([a, b]) = r {
                     if !a.is_empty() && !b.is_empty() {
                         v.push((a, b));
                     }
                 }
-            });
+            }
         }
         v
     });
@@ -503,20 +598,36 @@ fn main() {
         }
     }
     let n = names.len();
-    let mut best: Vec<B> = vec![&[]; n];
-    let mut has = vec![false; n];
+    // each component is named by its byte-wise smallest ID
+    let mut best: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        if !has[r] || names[i] < best[r] {
-            best[r] = names[i];
-            has[r] = true;
+        if names[i] < names[best[r] as usize] {
+            best[r] = i as u32;
         }
     }
-    let mut persons = SMap::new(n);
+    let mut rph = vec![0u64; n];
+    let mut rnm = vec![0u64; n];
     for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        persons.set(names[i], phash(best[r]), pack_name(best[r]));
+        if parent[i] as usize == i {
+            let nm = names[best[i] as usize];
+            rph[i] = phash(nm);
+            rnm[i] = pack_name(nm);
+        }
     }
+    // turn the ID table into the person table in place: v2 = person key, v3 = packed name
+    for e in ids.kt.e.iter_mut() {
+        if e[2] != kt::EMPTY {
+            let r = find(&mut parent, e[2] as u32) as usize;
+            e[2] = rph[r];
+            e[3] = rnm[r];
+        }
+    }
+    for v in ids.long.values_mut() {
+        let r = find(&mut parent, v.0 as u32) as usize;
+        *v = (rph[r], rnm[r]);
+    }
+    let persons = ids;
     lap("links");
 
     let cx = Ctx { ws, we, products, ncat: unknown_idx, camps, persons };

@@ -5,6 +5,18 @@
 pub const EMPTY: u64 = u64::MAX;
 
 #[inline(always)]
+pub fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    }
+}
+
+#[inline(always)]
 fn ld8(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
@@ -60,6 +72,11 @@ impl KT {
     #[inline(always)]
     fn slot(&self, k0: u64, k1: u64) -> usize {
         (mix(k0, k1, 0x5851_F42D_4C95_7F2D) as usize) & self.mask
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, k0: u64, k1: u64) {
+        prefetch(&self.e[self.slot(k0, k1)] as *const [u64; 4]);
     }
 
     #[inline(always)]
