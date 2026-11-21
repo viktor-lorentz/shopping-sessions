@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      bench_events:
+        description: "events for the timing run (20000000 = practice size, 60000000 = final size)"
+        default: "20000000"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      B: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install polars
+      - name: Build generator
+        run: |
+          mkdir -p /tmp/gen && cd /tmp/gen
+          curl -sSfL -o generator.zip $B/generator.zip && unzip -q generator.zip
+          cargo build --release --manifest-path /tmp/gen/generator/Cargo.toml
+      - name: Fetch dev answer
+        run: |
+          mkdir -p /tmp/ans && cd /tmp/ans
+          curl -sSfL -o dev-answer.zip $B/dev-answer.zip && unzip -q dev-answer.zip
+      - name: Build image (linux/amd64)
+        run: docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+      - name: Fixtures through the scorer-style container
+        run: python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Dev set (seed 1) vs official answer
+        run: |
+          /tmp/gen/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          rm -rf /tmp/out && time scripts/docker_run.sh /tmp/dev /tmp/out
+          python3 scripts/compare.py /tmp/out /tmp/ans/dev-answer
+      - name: Multi-seed diff against the oracle (native binary)
+        run: |
+          cargo build --release
+          GEN=/tmp/gen/generator/target/release/generate PY=python3 scripts/multiseed.sh 2 20 150000
+      - name: Timing run (container, scorer limits)
+        run: |
+          E=${{ github.event.inputs.bench_events || '20000000' }}
+          /tmp/gen/generator/target/release/generate --seed 7 --events $E --clicks $((E/4)) --output /tmp/bench
+          for i in 1 2 3; do rm -rf /tmp/bout; /usr/bin/time -f "run $i: %e s, maxrss %M KB" scripts/docker_run.sh /tmp/bench /tmp/bout; done
