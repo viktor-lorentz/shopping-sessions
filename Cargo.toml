@@ -1,0 +1,19 @@
+[package]
+name = "shopping"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shopping"
+path = "src/main.rs"
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
