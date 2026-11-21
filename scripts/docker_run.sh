@@ -29,5 +29,5 @@ docker run --rm --platform "$PLATFORM" \
   --user 1000:1000 \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
+  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" -e SS_TIMING="${SS_TIMING:-}" \
   "$IMAGE"

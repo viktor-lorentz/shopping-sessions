@@ -15,6 +15,7 @@ jobs:
       B: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
       CPUS: "4"
       MEM: "12g"
+      SS_TIMING: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,7 +38,7 @@ jobs:
       - name: Dev set (seed 1) vs official answer
         run: |
           /tmp/gen/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
-          rm -rf /tmp/out && time scripts/docker_run.sh /tmp/dev /tmp/out
+          sudo rm -rf /tmp/out && time scripts/docker_run.sh /tmp/dev /tmp/out
           python3 scripts/compare.py /tmp/out /tmp/ans/dev-answer
       - name: Multi-seed diff against the oracle (native binary)
         run: |
@@ -47,4 +48,4 @@ jobs:
         run: |
           E=${{ github.event.inputs.bench_events || '20000000' }}
           /tmp/gen/generator/target/release/generate --seed 7 --events $E --clicks $((E/4)) --output /tmp/bench
-          for i in 1 2 3; do rm -rf /tmp/bout; /usr/bin/time -f "run $i: %e s, maxrss %M KB" scripts/docker_run.sh /tmp/bench /tmp/bout; done
+          for i in 1 2 3; do sudo rm -rf /tmp/bout; /usr/bin/time -f "run $i: %e s, maxrss %M KB" scripts/docker_run.sh /tmp/bench /tmp/bout; done

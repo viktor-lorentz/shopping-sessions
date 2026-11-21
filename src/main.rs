@@ -315,7 +315,7 @@ fn json_str(s: &str, key: &str) -> Option<String> {
 
 fn main() {
     let t0 = Instant::now();
-    let timing = std::env::var("SS_TIMING").is_ok();
+    let timing = std::env::var("SS_TIMING").map_or(false, |v| !v.is_empty());
     let lap = |name: &str| {
         if timing {
             eprintln!("[{:>8.1} ms] {}", t0.elapsed().as_secs_f64() * 1000.0, name);
