@@ -461,6 +461,7 @@ struct Acc {
     cnt: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
+    dcat: Vec<i64>, // per-day category revenue scratch
 }
 
 fn json_str(s: &str, key: &str) -> Option<String> {
@@ -732,7 +733,7 @@ fn main() {
             u_name: vec![], u_day: vec![], u_sessions: vec![], u_events: vec![], u_rev: vec![], u_cat: vec![],
             c_sessions: vec![0; ncamp1 * ndays], c_purch: vec![0; ncamp1 * ndays],
             c_rev: vec![0; ncamp1 * ndays], c_assist: vec![0; ncamp1 * ndays],
-            cnt: vec![0; ncamp1], pos: vec![0; ncamp1], active: vec![],
+            cnt: vec![0; ncamp1], pos: vec![0; ncamp1], active: vec![], dcat: vec![0; ncat_total],
         };
         loop {
             let b = next_p.fetch_add(1, Ordering::Relaxed);
@@ -869,57 +870,62 @@ fn rem_click(acc: &mut Acc, c: u32) {
     }
 }
 
-struct Sess {
-    start: i64,
-    events: i64,
-    rev: i64,
-    purchases: i64,
-    cat_rev: Vec<i64>,
-}
-
-fn process_person(pe: &[Ev], pc: &[Ck], acc: &mut Acc, ncamp: usize, ndays: usize, day0: i64, ncat: usize) {
-    // sessionize
-    let name = unpack_name(pe[0].name);
-    let mut sessions: Vec<Sess> = Vec::new();
-    let mut prev = i64::MIN;
-    for e in pe {
-        if sessions.is_empty() || e.ts - prev > 1_800_000 {
-            sessions.push(Sess { start: e.ts, events: 0, rev: 0, purchases: 0, cat_rev: vec![0; ncat] });
-        }
-        prev = e.ts;
-        let s = sessions.last_mut().unwrap();
-        s.events += 1;
-        if e.ty == 2 {
-            s.rev += e.price as i64;
-            s.purchases += 1;
-            s.cat_rev[e.cat as usize] += e.price as i64;
-        }
-    }
-    // attribution
-    let (mut lo, mut hi) = (0usize, 0usize);
-    let mut cur_day = i64::MIN;
-    let mut d_sessions = 0i64;
-    let mut d_events = 0i64;
-    let mut d_rev = 0i64;
-    let mut d_cat = vec![0i64; ncat];
-    let flush = |acc: &mut Acc, day: i64, s: i64, ev: i64, rev: i64, cat: &[i64]| {
-        acc.u_name.push(name);
-        acc.u_day.push(day as i32);
-        acc.u_sessions.push(s);
-        acc.u_events.push(ev);
-        acc.u_rev.push(rev);
-        let mut top = 255u8;
+fn flush_day(acc: &mut Acc, name: B, day: i64, s: i64, ev: i64, rev: i64) {
+    acc.u_name.push(name);
+    acc.u_day.push(day as i32);
+    acc.u_sessions.push(s);
+    acc.u_events.push(ev);
+    acc.u_rev.push(rev);
+    let mut top = 255u8;
+    if rev > 0 {
         let mut bv = 0i64;
-        for (k, &v) in cat.iter().enumerate() {
+        for k in 0..acc.dcat.len() {
+            let v = acc.dcat[k];
             if v > bv {
                 bv = v;
                 top = k as u8;
             }
+            acc.dcat[k] = 0;
         }
-        acc.u_cat.push(top);
-    };
-    for s in &sessions {
-        let st = s.start;
+    }
+    acc.u_cat.push(top);
+}
+
+/// One pass over a person's events (sorted by ts): sessionize, attribute, aggregate. No allocation.
+fn process_person(pe: &[Ev], pc: &[Ck], acc: &mut Acc, ncamp: usize, ndays: usize, day0: i64, _ncat: usize) {
+    let name = unpack_name(pe[0].name);
+    let (mut lo, mut hi) = (0usize, 0usize);
+    let mut cur_day = i64::MIN;
+    let (mut d_s, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
+    let mut i = 0usize;
+    while i < pe.len() {
+        let st = pe[i].ts;
+        let day = st.div_euclid(DAY);
+        if day != cur_day {
+            if cur_day != i64::MIN {
+                flush_day(acc, name, cur_day, d_s, d_ev, d_rev);
+            }
+            cur_day = day;
+            d_s = 0;
+            d_ev = 0;
+            d_rev = 0;
+        }
+        // extend the session while gaps between consecutive (distinct) timestamps are <= 30 min
+        let mut prev = st;
+        let (mut ev, mut rev, mut purch) = (0i64, 0i64, 0i64);
+        let mut j = i;
+        while j < pe.len() && pe[j].ts - prev <= 1_800_000 {
+            let e = &pe[j];
+            prev = e.ts;
+            ev += 1;
+            if e.ty == 2 {
+                rev += e.price as i64;
+                purch += 1;
+                acc.dcat[e.cat as usize] += e.price as i64;
+            }
+            j += 1;
+        }
+        // attribution: clicks with st - 7d <= ts <= st
         while hi < pc.len() && pc[hi].ts <= st {
             add_click(acc, pc[hi].camp);
             hi += 1;
@@ -931,46 +937,32 @@ fn process_person(pe: &[Ev], pc: &[Ck], acc: &mut Acc, ncamp: usize, ndays: usiz
         let credit = if lo == hi {
             ncamp
         } else {
-            let mut j = hi - 1;
-            let t = pc[j].ts;
-            while j > lo && pc[j - 1].ts == t {
-                j -= 1;
+            let mut k = hi - 1;
+            let t = pc[k].ts;
+            while k > lo && pc[k - 1].ts == t {
+                k -= 1;
             }
-            pc[j].camp as usize
+            pc[k].camp as usize
         };
-        let day = st.div_euclid(DAY);
         let di = (day - day0) as usize;
         debug_assert!(di < ndays);
-        let k = credit * ndays + di;
-        acc.c_sessions[k] += 1;
-        if s.purchases > 0 {
-            acc.c_purch[k] += 1;
+        let kk = credit * ndays + di;
+        acc.c_sessions[kk] += 1;
+        if purch > 0 {
+            acc.c_purch[kk] += 1;
         }
-        acc.c_rev[k] += s.rev as u64;
+        acc.c_rev[kk] += rev as u64;
         for a in 0..acc.active.len() {
             let c = acc.active[a] as usize;
             acc.c_assist[c * ndays + di] += 1;
         }
-        // user_daily accumulation
-        if day != cur_day {
-            if cur_day != i64::MIN {
-                flush(acc, cur_day, d_sessions, d_events, d_rev, &d_cat);
-            }
-            cur_day = day;
-            d_sessions = 0;
-            d_events = 0;
-            d_rev = 0;
-            d_cat.iter_mut().for_each(|x| *x = 0);
-        }
-        d_sessions += 1;
-        d_events += s.events;
-        d_rev += s.rev;
-        for (k, v) in s.cat_rev.iter().enumerate() {
-            d_cat[k] += v;
-        }
+        d_s += 1;
+        d_ev += ev;
+        d_rev += rev;
+        i = j;
     }
     if cur_day != i64::MIN {
-        flush(acc, cur_day, d_sessions, d_events, d_rev, &d_cat);
+        flush_day(acc, name, cur_day, d_s, d_ev, d_rev);
     }
     for t in lo..hi {
         rem_click(acc, pc[t].camp);
