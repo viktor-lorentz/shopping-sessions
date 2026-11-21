@@ -2,3 +2,5 @@ commit	local_score	submitted	server_score	notes
 feff543	CI 20M 4vCPU 6.6s (docker)	yes BB-2FEE3801	3.61 s	v1 + kill-bitmap dedup; correct on hidden data
 384fc9c	bench seed7 4.25s	no	-	key tables; profile: lookups 21%, memchr 17%
 37c3382	bench seed7 3.17s (was 4.25); docker CI 3.14-3.25s	ready, notified user	-	AVX2 tokenizer + prefetch + in-place person table; fixtures, dev, seeds 30-37 MATCH
+5d0bff3	bench seed7 3.14-3.19s	no	-	allocation-free process_person; neutral (sessions phase is sort-bound); kept
+09e41ad	bench pending (run 44853842291)	no	-	fast civil timestamp parse; fixtures, dev, seeds 46-51 MATCH. Track paused: user switched agent to CAD De-ID. Best-to-submit: 37c3382 (or 09e41ad once benched)
