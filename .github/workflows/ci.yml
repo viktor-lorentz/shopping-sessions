@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 60
     env:
       B: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+      CPUS: "4"
+      MEM: "12g"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
